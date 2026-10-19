@@ -1275,8 +1275,8 @@ func dshPutRoute(items []dshItem, on bool, models []catalog.Model, gw string) ([
 // as magpie writes it now (#2504, h4rk8s): a model that works only with
 // them would fail again after each sync. They stay on the same model of a
 // route still on the same protocol; a model new to the route, or a route
-// whose protocol changed, starts without them. A switch magpie sets itself
-// is put as magpie has it now.
+// whose protocol changed, starts without them. DeepSeek's Chat switches are
+// defaults the user may override; other switches magpie sets stay its own.
 func dshKeepCompat(cur, route *yaml.Node) {
 	api := yamlKey(cur, "api")
 	if api == nil || yamlKey(route, "api") == nil || api.Value != yamlKey(route, "api").Value {
@@ -1297,13 +1297,35 @@ func dshKeepCompat(cur, route *yaml.Node) {
 	}
 	for _, m := range ms.Content {
 		id := yamlKey(m, "id")
-		if id == nil || old[id.Value] == nil {
+		if id == nil {
 			continue
 		}
-		c := yamlMapping(m, "compat")
+		c := yamlKey(m, "compat")
+		// A route-level choice is inherited unless this model has an
+		// override of its own; a generated default must not shadow it.
+		for _, key := range []string{"thinkingFormat", "requiresReasoningContentOnAssistantMessages"} {
+			if c != nil && yamlKey(yamlKey(cur, "compat"), key) != nil {
+				yamlDelKey(c, key)
+			}
+		}
+		if c != nil && len(c.Content) == 0 {
+			yamlDelKey(m, "compat")
+			c = nil
+		}
+		if old[id.Value] == nil {
+			continue
+		}
 		for j := 0; j+1 < len(old[id.Value].Content); j += 2 {
-			if yamlKey(c, old[id.Value].Content[j].Value) == nil {
-				yamlSetKey(c, old[id.Value].Content[j].Value, old[id.Value].Content[j+1])
+			key := old[id.Value].Content[j].Value
+			chatThinking := key == "thinkingFormat" || key == "requiresReasoningContentOnAssistantMessages"
+			if chatThinking && api.Value != "openai-completions" {
+				continue
+			}
+			if chatThinking || yamlKey(c, key) == nil {
+				if c == nil {
+					c = yamlMapping(m, "compat")
+				}
+				yamlSetKey(c, key, old[id.Value].Content[j+1])
 			}
 		}
 	}
@@ -1337,7 +1359,9 @@ type dshPiModel struct {
 // pi-ai asks a model for a thinking budget unless forceAdaptiveThinking is
 // set, and a Claude that thinks only adaptively turns a budget away.
 type dshPiCompat struct {
-	ForceAdaptiveThinking bool `yaml:"forceAdaptiveThinking,omitempty"`
+	ForceAdaptiveThinking                       bool   `yaml:"forceAdaptiveThinking,omitempty"`
+	ThinkingFormat                              string `yaml:"thinkingFormat,omitempty"`
+	RequiresReasoningContentOnAssistantMessages bool   `yaml:"requiresReasoningContentOnAssistantMessages,omitempty"`
 }
 
 // dshAPIs are the wire protocols of llm-pi-ai's (pi-ai's api names) a route
@@ -1529,6 +1553,14 @@ func dshKindConfig(k dshKind, models []catalog.Model, api, gw string) dshPiRoute
 		_, e.ReasoningEfforts = dshModelLevels(m.Efforts)
 		if api == "anthropic-messages" && gateway.AdaptiveThinking(m.ID) {
 			e.Compat = &dshPiCompat{ForceAdaptiveThinking: true}
+		}
+		// pi-ai sees magpie at loopback, so it cannot detect DeepSeek's
+		// thinking toggle or reasoning replay from its provider and URL.
+		model := m.ID[strings.LastIndexByte(m.ID, '/')+1:]
+		if api == "openai-completions" && !strings.HasPrefix(m.ID, "group/") &&
+			strings.HasPrefix(strings.ToLower(model), "deepseek-") &&
+			e.ReasoningEfforts != nil && e.ReasoningEfforts.Off != "" {
+			e.Compat = &dshPiCompat{ThinkingFormat: "deepseek", RequiresReasoningContentOnAssistantMessages: true}
 		}
 		r.Models = append(r.Models, e)
 	}

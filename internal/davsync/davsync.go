@@ -269,7 +269,8 @@ func Configure(c Config) error {
 	// after a sync in progress, which would save its state for the setup it
 	// began with
 	return locked(func() error {
-		if old, ok := Load(); ok {
+		old, had := Load()
+		if had {
 			kept, needed := password(old.saved(c), c)
 			if kept {
 				c.Password = old.saved(c).Password
@@ -333,6 +334,29 @@ func Configure(c Config) error {
 			return err
 		}
 		os.MkdirAll(settings.Dir(), 0o755)
+		// Rejoining a part is its first sync, not an edit to everything
+		// left here while it was excluded. Older states hashed those parts
+		// as null/empty; forget only their local baselines before enabling.
+		if had && stateKey(old) == stateKey(c) {
+			st := loadState()
+			if st.Key == stateKey(c) {
+				reset := false
+				for _, p := range Parts {
+					if !old.syncs(p) && c.syncs(p) {
+						delete(st.Local, p)
+						if st.Blind != nil {
+							delete(st.Blind.Local, p)
+						}
+						reset = true
+					}
+				}
+				if reset {
+					if err := saveState(st); err != nil {
+						return fmt.Errorf("preparing the parts rejoining sync: %w", err)
+					}
+				}
+			}
+		}
 		if err := edit.WriteAtomic(path("sync.json"), b); err != nil {
 			return err
 		}
@@ -552,12 +576,15 @@ func loadState() state {
 // state, which starts sync afresh and loses a restore's Undo and the Blind
 // guard: such a file is kept aside first, and one that can't be isn't
 // written over.
-func saveState(st state) {
-	if lastgood.KeepUnparsed(path("sync-state.json"), lastgood.Into[state]) != nil {
-		return
+func saveState(st state) error {
+	if err := lastgood.KeepUnparsed(path("sync-state.json"), lastgood.Into[state]); err != nil {
+		return err
 	}
-	b, _ := json.MarshalIndent(st, "", "  ")
-	edit.WriteAtomic(path("sync-state.json"), b)
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return edit.WriteAtomic(path("sync-state.json"), b)
 }
 
 // stateKey is the setup the state is for: an S3 endpoint too, when there is one
@@ -823,6 +850,19 @@ func orEmpty[V any](m map[string]V) map[string]V {
 	return m
 }
 
+// localHashes records only parts this computer actually participated in.
+// A missing part joins from the server next time; a hash of an excluded
+// part would instead turn its old contents into a local-only edit.
+func (c Config) localHashes(b backup.Bundle) map[string]string {
+	h := hashes(b)
+	for _, p := range Parts {
+		if !c.syncs(p) {
+			delete(h, p)
+		}
+	}
+	return h
+}
+
 // take puts from's part in to. The merged bundle is a sync one (BundleVersion):
 // its per-part markers, not the whole-bundle Keys bit, say which part
 // carries credentials, so a keyed providers upload no longer tells a reader
@@ -1063,7 +1103,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 	if err != nil {
 		return err
 	}
-	L := hashes(local)
+	L := c.localHashes(local)
 	if unchanged {
 		if maps.Equal(L, st.Local) {
 			return nil // nothing changed on either side
@@ -1179,8 +1219,9 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 			take(&merged, local, p)
 			continue
 		}
-		lc := !first && L[p] != st.Local[p]
-		rc := first || R[p] != st.Remote[p]
+		unseen := st.Local[p] == ""
+		lc := !unseen && L[p] != st.Local[p]
+		rc := unseen || R[p] != st.Remote[p]
 		switch {
 		case lc && !rc:
 			take(&merged, local, p)
@@ -1189,7 +1230,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 				keepUnseenGatewayKeys(&remote, local)
 			}
 			bringIn = append(bringIn, p)
-			if first {
+			if unseen {
 				here = append(here, p)
 			}
 		case lc && rc: // both: the newer stays
@@ -1229,10 +1270,13 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 		if local, err = collect(c); err != nil {
 			return err
 		}
-		now = hashes(local)
+		now = c.localHashes(local)
 	}
 	M, pending := hashes(merged), map[string]string{}
 	for _, p := range Parts {
+		if !c.syncs(p) {
+			continue
+		}
 		pending[p] = now[p]
 		if M[p] != R[p] && st.Local != nil {
 			pending[p] = st.Local[p]

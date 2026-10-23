@@ -68,6 +68,14 @@ on both sides keeps the newer version while retaining the replaced copy.
 A conditional write refused because another computer committed in between
 is retried through this same merge.
 
+A part left out of sync has no local baseline. Turning library or agent
+model sync back on joins that part from the server, keeping its displaced
+local contents in the sync folder, even when the server file is unchanged
+(HTTP 304). `Configure` also clears the old null/empty baselines written by
+earlier versions when such a part rejoins. Once joined, intentional local
+edits upload normally. Turning all sync off and on again to the same server
+keeps existing baselines and offline edits (#939); it is not a rejoin.
+
 When a remote file is empty, damaged or another app's format, sync stops and
 describes it through `ServerFile`. Settings and the backend's `upload` command
 can replace it with this computer's setup, keeping the old file first.
